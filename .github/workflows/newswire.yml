@@ -1,0 +1,51 @@
+name: newswire
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # 5분마다 (GitHub 사정으로 몇 분 밀릴 수 있음)
+  workflow_dispatch:           # Actions 탭에서 수동 실행
+    inputs:
+      check:
+        description: "피드 생존 점검만 하기 (발송 안 함)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: newswire
+  cancel-in-progress: false    # 이전 실행이 안 끝났으면 기다림 (중복 발송 방지)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 피드 점검
+        if: ${{ inputs.check }}
+        run: python3 newswire.py --check
+
+      - name: 상태 복원 (이미 보낸 기사 목록)
+        if: ${{ !inputs.check }}
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: newswire-state-${{ github.run_id }}
+          restore-keys: newswire-state-
+
+      - name: 수집·발송
+        if: ${{ !inputs.check }}
+        run: python3 newswire.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          ADMIN_CHAT_ID:      ${{ secrets.ADMIN_CHAT_ID }}
+          LOOP_MINUTES:       ${{ vars.LOOP_MINUTES || '4' }}
+
+      - name: 상태 저장
+        if: ${{ always() && !inputs.check }}
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: newswire-state-${{ github.run_id }}-${{ github.run_attempt }}
