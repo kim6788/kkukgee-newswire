@@ -99,11 +99,11 @@ LLM_TIMEOUT = 60
 # ─────────────────────────────────────────────
 # 5) 발송 규칙
 # ─────────────────────────────────────────────
-SEND_NOW_MIN = 4             # 4~5점: 즉시 발송
-DIGEST_MIN = 3               # 3점: 묶음으로 모았다가 정해진 시각에 발송
+SEND_NOW_MIN = 3             # 3~5점: 전부 바로바로 발송 (묶음 대기 없음)
+DIGEST_MIN = 3               # 한 번에 상한(MAX_SEND_PER_RUN) 넘친 것만 묶음으로
 DIGEST_HOURS_KST = [7, 12, 18]
 DIGEST_MAX_ITEMS = 15
-QUIET_HOURS_KST = range(0, 6)  # 이 시간엔 5점(속보급)만 즉시, 4점은 07시 묶음으로
+QUIET_HOURS_KST = range(0)   # 새벽 보류 없음 — 24시간 바로 발송 (예전값: range(0, 6))
 MAX_AGE_HOURS = 3            # 이보다 오래된 기사는 무시 (첫 실행·지연 대비)
 SIMILAR_TITLE = 0.55         # 제목 유사도 이 이상이면 같은 기사로 보고 중복 제거
 MAX_SEND_PER_RUN = 12        # 한 번 돌 때 즉시 발송 상한 (폭주 방지)
