@@ -10,10 +10,15 @@
   ADMIN_CHAT_ID       (선택)  피드 고장 경고·실행 로그를 받을 개인 채팅
   LOOP_MINUTES        (선택)  0이면 1회 수집 후 종료. 4면 한 실행 안에서 4분간 1분 간격 재수집
   DRY_RUN=1           (선택)  텔레그램 대신 콘솔 출력
+
+상시 실행:  python newswire.py --forever   (Windows는 pythonw, Termux는 python)
+  - 같은 폴더의 secrets.env 에서 키를 읽음 (KEY=값 한 줄씩)
+  - 로그는 newswire.log, 중복 실행은 자동 차단
 """
 import concurrent.futures as cf
 import datetime as dt
 import email.utils
+import gzip
 import hashlib
 import html
 import json
@@ -31,7 +36,27 @@ import config as C
 KST = dt.timezone(dt.timedelta(hours=9))
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(BASE, "state", "state.json")
+SECRETS_PATH = os.path.join(BASE, "secrets.env")
+LOG_PATH = os.path.join(BASE, "newswire.log")
 DRY = os.environ.get("DRY_RUN") == "1"
+
+
+def load_secrets():
+    """secrets.env (KEY=값) → 환경변수. 이미 환경변수에 있으면 그대로 둠. 매 바퀴 다시 읽어서
+    파일만 고쳐도 재시작 없이 반영됨."""
+    try:
+        with open(SECRETS_PATH, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if v and (k not in os.environ or os.environ.get("_FROM_SECRETS_" + k)):
+                    os.environ[k] = v
+                    os.environ["_FROM_SECRETS_" + k] = "1"
+    except FileNotFoundError:
+        pass
 
 
 def log(*a):
@@ -75,14 +100,18 @@ def save_state(s):
 # ═════════════════════════ 수집 ═════════════════════════
 def http_get(url, etag=None, lm=None, timeout=None):
     req = urllib.request.Request(url, headers={"User-Agent": C.USER_AGENT,
-                                               "Accept": "application/rss+xml, application/xml, text/xml, */*"})
+                                               "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                                               "Accept-Encoding": "gzip"})   # 데이터 사용량 ~1/5
     if etag:
         req.add_header("If-None-Match", etag)
     if lm:
         req.add_header("If-Modified-Since", lm)
     try:
         with urllib.request.urlopen(req, timeout=timeout or C.HTTP_TIMEOUT) as r:
-            return r.status, r.read(), r.headers.get("ETag"), r.headers.get("Last-Modified")
+            body = r.read()
+            if (r.headers.get("Content-Encoding") or "").lower() == "gzip" or body[:2] == b"\x1f\x8b":
+                body = gzip.decompress(body)
+            return r.status, body, r.headers.get("ETag"), r.headers.get("Last-Modified")
     except urllib.error.HTTPError as e:
         if e.code == 304:
             return 304, b"", etag, lm
@@ -262,6 +291,19 @@ def excluded(it):
     return any(x in it["title"] for x in C.EXCLUDE)
 
 
+EXCL_RE = re.compile(r"[\[\(【<〈]\s*단독\s*[\]\)】>〉]|^단독\s|^단독[:：]")
+
+
+def is_exclusive(it):
+    return bool(EXCL_RE.search(it["title"]))
+
+
+def sector_hit(it):
+    """제목에 관심 업종(AIDC·전력 / 반도체·기판 / AI / 정책) 키워드가 하나라도 있는지"""
+    return any(r.search(it["title"]) for th in ("AIDC·전력", "반도체·기판", "AI", "정책")
+               for r in KW[th][1])
+
+
 # ═════════════════════════ 2차: Claude ═════════════════════════
 PROMPT = """너는 한국 주식 리서치 채널의 데스크다. 아래 기사(제목+RSS요약)를 투자자 관점에서 심사해라.
 관심 영역: AI·AI데이터센터·전력기기/에너지, 반도체·기판·소부장, 이와 관련된 정부 정책·규제, 시장을 움직일 속보(대형 수주·공시·실적).
@@ -274,6 +316,7 @@ PROMPT = """너는 한국 주식 리서치 채널의 데스크다. 아래 기사
   3 = 관련은 있지만 묶어서 봐도 되는 수준 (전망, 증권사 의견, 인터뷰, 업계 동향, 행사·MOU)
   2 이하 = 홍보성·칼럼·재탕·지역 행사·관심 영역 밖
   엄격하게 매겨라. 애매하면 낮은 점수. 대부분의 기사는 3 이하가 정상이다.
+  단, 제목에 [단독]이 붙은 기사가 관심 영역(위 4가지)과 관련 있으면 최소 4점.
 - theme: "AIDC·전력" | "반도체·기판" | "AI" | "정책" | "시장" 중 하나
 - summary: 기사가 말하는 핵심 사실을 80자 이내 한국어 한두 문장으로. 제목을 그대로 베끼지 말고 숫자·주체·결정 위주. 원문 문장을 복사하지 말 것.
 - stocks: 직접 언급되거나 직접 수혜/피해가 명확한 상장사 최대 3개. 한국 종목은 "#종목명", 미국 종목은 "$티커". 확실하지 않으면 빈 배열.
@@ -492,6 +535,9 @@ def one_pass(state):
                 sc = 3 if c["kw"] >= 4 else 2
             c.update(score=sc, theme={"시장속보": "시장"}.get(c["kw_theme"], c["kw_theme"]),
                      summary="", stocks=[])
+        # 단독 기사: 관심 영역 키워드가 제목에 하나라도 있으면 최소 4점 (바로 발송)
+        if is_exclusive(c) and sector_hit(c):
+            c["score"] = max(c["score"], 4)
 
     quiet = now.hour in C.QUIET_HOURS_KST
     now_list, later = [], []
@@ -505,7 +551,7 @@ def one_pass(state):
     hour_ago = time.time() - 3600
     state["sent_ts"] = [t for t in state.get("sent_ts", []) if t > hour_ago]
     room = max(0, min(C.MAX_SEND_PER_RUN, C.MAX_SEND_PER_HOUR - len(state["sent_ts"])))
-    now_list.sort(key=lambda x: (-x["score"], -(x.get("kw") or 0)))
+    now_list.sort(key=lambda x: (-x["score"], not is_exclusive(x), -(x.get("kw") or 0)))
     sent = 0
     for c in now_list[:room]:
         if tg_send(fmt_item(c), silent=c["score"] < C.SILENT_BELOW):
@@ -542,7 +588,55 @@ def health(state):
         tg_send(msg, chat=admin)
 
 
+def _open_log():
+    """--forever: 출력을 newswire.log 로 (2MB 넘으면 .old 로 넘김). pythonw 는 콘솔이 없어서 필수."""
+    try:
+        if os.path.getsize(LOG_PATH) > 2_000_000:
+            os.replace(LOG_PATH, LOG_PATH + ".old")
+    except OSError:
+        pass
+    f = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = f
+
+
+def forever():
+    """PC 상시 실행. 1분마다 수집 → 발송. 어떤 오류가 나도 죽지 않고 다음 바퀴로."""
+    import socket
+    import traceback
+    _open_log()
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", 47615))            # 이미 실행 중이면 포트가 잡혀 있음 → 종료
+    except OSError:
+        log("이미 실행 중 — 이 창은 종료")
+        return
+    log("=== 뉴스와이어 시작 (PC 상시 모드) ===")
+    state = load_state()
+    last_health = 0
+    while True:
+        t0 = time.time()
+        try:
+            load_secrets()
+            if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+                log("secrets.env 에 TELEGRAM_BOT_TOKEN 이 비어 있음 — 1분 뒤 다시 확인")
+            else:
+                one_pass(state)
+                maybe_digest(state)
+                if time.time() - last_health > 3600:
+                    health(state)
+                    last_health = time.time()
+            save_state(state)
+        except Exception:                          # noqa: BLE001
+            log("오류 (계속 진행):\n" + traceback.format_exc())
+        time.sleep(max(5, C.POLL_SECONDS - (time.time() - t0)))
+
+
 def main():
+    load_secrets()
+    if "--forever" in sys.argv:
+        forever()
+        return
+
     if "--check" in sys.argv:              # 피드 생존 점검만
         st = {"feeds": {}}
         for name, url in all_sources():
