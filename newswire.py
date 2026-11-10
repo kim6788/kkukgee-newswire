@@ -56,6 +56,7 @@ def load_state():
     s.setdefault("feeds", {})           # 피드별 etag / 실패 횟수
     s.setdefault("alert_day", "")
     s.setdefault("warm", False)         # 첫 실행 워밍업 완료 여부
+    s.setdefault("sent_ts", [])         # 최근 즉시 발송 시각 (시간당 상한용)
     return s
 
 
@@ -268,12 +269,13 @@ PROMPT = """너는 한국 주식 리서치 채널의 데스크다. 아래 기사
 각 기사마다 JSON 객체 하나:
 - id: 입력의 id 그대로
 - score: 1~5 정수
-  5 = 지금 바로 알려야 할 속보급 (대형 정책 발표, 대형 수주/계약, 실적 서프라이즈, 수출통제·관세 같은 판을 바꾸는 뉴스)
-  4 = 관심 영역의 의미 있는 새 사실 (구체적 숫자·계약·일정·결정이 있음)
-  3 = 관련은 있지만 묶어서 봐도 되는 수준 (전망, 인터뷰, 업계 동향)
-  2 이하 = 홍보성·행사·칼럼·재탕·관심 영역 밖
+  5 = 지금 바로 알려야 할 속보급 — 주가를 당일 움직일 사건 (대형 정책 확정, 수천억 이상 수주·공급계약, 실적 서프라이즈/쇼크, 수출통제·관세 등 판을 바꾸는 뉴스). 하루 2~3건 수준.
+  4 = 관심 영역에서 새로 확정된 구체적 사실 (숫자·계약 상대·일정·정부 결정이 기사에 명시됨). 하루 10건 안쪽.
+  3 = 관련은 있지만 묶어서 봐도 되는 수준 (전망, 증권사 의견, 인터뷰, 업계 동향, 행사·MOU)
+  2 이하 = 홍보성·칼럼·재탕·지역 행사·관심 영역 밖
+  엄격하게 매겨라. 애매하면 낮은 점수. 대부분의 기사는 3 이하가 정상이다.
 - theme: "AIDC·전력" | "반도체·기판" | "AI" | "정책" | "시장" 중 하나
-- summary: 기사가 말하는 핵심 사실을 50자 이내 한국어 한 문장으로. 제목을 그대로 베끼지 말고 숫자·주체·결정 위주. 원문 문장을 복사하지 말 것.
+- summary: 기사가 말하는 핵심 사실을 80자 이내 한국어 한두 문장으로. 제목을 그대로 베끼지 말고 숫자·주체·결정 위주. 원문 문장을 복사하지 말 것.
 - stocks: 직접 언급되거나 직접 수혜/피해가 명확한 상장사 최대 3개. 한국 종목은 "#종목명", 미국 종목은 "$티커". 확실하지 않으면 빈 배열.
 
 JSON 배열만 출력. 설명·코드펜스 금지.
@@ -332,20 +334,21 @@ def parse_llm(text, n):
             stocks = [s for s in (o.get("stocks") or []) if isinstance(s, str) and re.match(r"^[#$]\S+$", s)][:3]
             out[i] = {"score": max(1, min(5, int(o.get("score", 1)))),
                       "theme": str(o.get("theme") or "")[:10],
-                      "summary": clean(str(o.get("summary") or ""), 80),
+                      "summary": clean(str(o.get("summary") or ""), 120),
                       "stocks": stocks}
     return out
 
 
 # ═════════════════════════ 텔레그램 ═════════════════════════
-def tg_send(text, chat=None):
+def tg_send(text, chat=None, silent=False):
     chat = chat or os.environ.get("TELEGRAM_CHAT_ID")
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if DRY or not token or not chat:
-        print("─" * 40 + "\n" + re.sub(r"<[^>]+>", "", text) + "\n", flush=True)
+        print("─" * 40 + ("  (무음)" if silent else "") + "\n" + re.sub(r"<[^>]+>", "", text) + "\n", flush=True)
         return True
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = json.dumps({"chat_id": chat, "text": text, "parse_mode": "HTML",
+                       "disable_notification": bool(silent),
                        "link_preview_options": {"is_disabled": True}}).encode()
     for _ in range(4):
         req = urllib.request.Request(url, data=data, headers={"content-type": "application/json"})
@@ -377,17 +380,40 @@ def esc(s):
     return html.escape(s or "", quote=False)
 
 
+def teaser(it, n=120):
+    """요약 대용: RSS 요약문 첫 문장(최대 n자). 제목과 거의 같으면 생략."""
+    d = re.sub(r"^\s*\[[^\]]{0,20}\]\s*", "", it.get("desc") or "")
+    d = re.sub(r"^\s*[\(\[][^\)\]]{0,30}[\)\]]\s*", "", d)                   # "(서울=연합뉴스)" "[이데일리]"
+    d = re.sub(r"^[가-힣A-Za-z·\s]{2,20}?(기자|특파원|객원기자)\s*[=:]?\s*", "", d)  # "홍길동 기자 ="
+    d = re.sub(r"^\S{0,12}=\s*", "", d).strip()
+    if not d or similar(norm_title(d[:60]), norm_title(it["title"])) > 0.6:
+        return ""
+    m = re.search(r"^(.{10,}?[다요음됨함]\.)\s", d + " ")
+    s = m.group(1) if m else d
+    return s if len(s) <= n else s[:n].rstrip() + "…"
+
+
+def stock_tags(it):
+    """LLM 종목 + 사전 매칭 종목을 합쳐 최대 4개."""
+    text = f"{it['title']} {it.get('desc') or ''}"
+    tags = list(it.get("stocks") or [])
+    found = sorted((text.find(name), tag) for name, tag in C.STOCKS.items() if name in text)
+    for _, tag in found:                       # 기사에 먼저 나온 종목부터 (제목 → 요약 순)
+        if tag not in tags:
+            tags.append(tag)
+    return tags[:4]
+
+
 def fmt_item(it):
-    head = "[속보] " if it["score"] >= 5 else ""
-    tag = f"[{it['theme']}] " if it.get("theme") else ""
-    lines = [f"<b>{head}{tag}{esc(it['title'])}</b>"]
-    if it.get("summary"):
-        lines.append(esc(it["summary"]))
-    if it.get("stocks"):
-        lines.append(" ".join(esc(s) for s in it["stocks"]))
-    when = it["date"].astimezone(KST).strftime("%H:%M") if it.get("date") else ""
-    lines.append(f'<a href="{html.escape(it["link"])}">{esc(it["src"])}</a> · {when}')
-    return "\n".join(lines)
+    head = "🚨 " if it["score"] >= 5 else ""
+    lines = [f'<b>{head}<a href="{html.escape(it["link"])}">{esc(it["title"])}</a></b>']
+    body = it.get("summary") or teaser(it)
+    if body:
+        lines.append(esc(body))
+    tags = stock_tags(it)
+    if tags:
+        lines.append(" ".join(esc(s) for s in tags))
+    return "\n\n".join(lines)
 
 
 def fmt_digest(buf, stamp):
@@ -397,8 +423,9 @@ def fmt_digest(buf, stamp):
     lines = [f"<b>꾹쥐 뉴스 묶음 ({stamp})</b>", ""]
     for x in buf[:C.DIGEST_MAX_ITEMS]:
         th = f"[{x['theme']}] " if x.get("theme") else ""
-        stocks = (" " + " ".join(esc(s) for s in x.get("stocks", []))) if x.get("stocks") else ""
-        lines.append(f'▪ {th}<a href="{html.escape(x["link"])}">{esc(x["title"])}</a> — {esc(x["src"])}{stocks}')
+        tags = stock_tags(x)
+        stocks = (" " + " ".join(esc(s) for s in tags)) if tags else ""
+        lines.append(f'▪ {th}<a href="{html.escape(x["link"])}">{esc(x["title"])}</a>{stocks}')
     if len(buf) > C.DIGEST_MAX_ITEMS:
         lines.append(f"\n외 {len(buf) - C.DIGEST_MAX_ITEMS}건")
     return "\n".join(lines)
@@ -451,9 +478,20 @@ def one_pass(state):
             c.update(r)
             if c["theme"] not in ("AIDC·전력", "반도체·기판", "AI", "정책", "시장"):
                 c["theme"] = {"시장속보": "시장"}.get(c["kw_theme"], c["kw_theme"])
-        else:          # LLM 없거나 실패 → 키워드 점수로 대체
-            c.update(score=5 if c["kw"] >= 12 else 4 if c["kw"] >= 7 else 3 if c["kw"] >= 4 else 2,
-                     theme={"시장속보": "시장"}.get(c["kw_theme"], c["kw_theme"]), summary="", stocks=[])
+        else:          # LLM 없거나 실패 → 키워드 점수로 대체 (보수적으로)
+            # 업종 키워드만으로는 중요도를 못 가리므로, 4점 이상은 '사건' 단어(수주·계약·정책결정 등)가
+            # 제목에 있어야만 줌. 나머지는 전부 3점(묶음)
+            event = any(r.search(c["title"]) for th in ("시장속보", "정책") for r in KW[th][1])
+            sector = sum(min(6, sum(2 for r in KW[th][1] if r.search(c["title"]))) * KW[th][0]
+                         for th in ("AIDC·전력", "반도체·기판", "AI"))
+            if event and c["kw"] >= 15 and sector >= 10:
+                sc = 5
+            elif event and c["kw"] >= 10:
+                sc = 4
+            else:
+                sc = 3 if c["kw"] >= 4 else 2
+            c.update(score=sc, theme={"시장속보": "시장"}.get(c["kw_theme"], c["kw_theme"]),
+                     summary="", stocks=[])
 
     quiet = now.hour in C.QUIET_HOURS_KST
     now_list, later = [], []
@@ -463,14 +501,20 @@ def one_pass(state):
         elif c["score"] >= C.DIGEST_MIN:
             later.append(c)
 
-    now_list.sort(key=lambda x: (-x["score"], x["date"] or now))
-    overflow = now_list[C.MAX_SEND_PER_RUN:]
-    for c in now_list[:C.MAX_SEND_PER_RUN]:
-        tg_send(fmt_item(c))
-    later += overflow
+    # 발송 상한: 한 바퀴 MAX_SEND_PER_RUN, 최근 1시간 MAX_SEND_PER_HOUR
+    hour_ago = time.time() - 3600
+    state["sent_ts"] = [t for t in state.get("sent_ts", []) if t > hour_ago]
+    room = max(0, min(C.MAX_SEND_PER_RUN, C.MAX_SEND_PER_HOUR - len(state["sent_ts"])))
+    now_list.sort(key=lambda x: (-x["score"], -(x.get("kw") or 0)))
+    sent = 0
+    for c in now_list[:room]:
+        if tg_send(fmt_item(c), silent=c["score"] < C.SILENT_BELOW):
+            state["sent_ts"].append(int(time.time()))
+            sent += 1
+    later += now_list[room:]
     for c in later:
-        state["digest"].append({k: c.get(k) for k in ("title", "link", "src", "theme", "score", "stocks")})
-    log(f"즉시 {min(len(now_list), C.MAX_SEND_PER_RUN)}건 · 묶음 대기 +{len(later)}건")
+        state["digest"].append({k: c.get(k) for k in ("title", "link", "src", "theme", "score", "stocks", "desc")})
+    log(f"즉시 {sent}건 · 묶음 대기 +{len(later)}건 (최근 1시간 발송 {len(state['sent_ts'])}건)")
 
 
 def maybe_digest(state):
@@ -480,7 +524,7 @@ def maybe_digest(state):
         return
     state["last_digest"] = stamp
     if state["digest"]:
-        tg_send(fmt_digest(state["digest"], now.strftime("%m/%d %H:00")))
+        tg_send(fmt_digest(state["digest"], now.strftime("%m/%d %H:00")), silent=True)
         log(f"묶음 발송 {len(state['digest'])}건")
         state["digest"] = []
 
