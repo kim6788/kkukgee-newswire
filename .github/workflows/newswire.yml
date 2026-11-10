@@ -9,6 +9,10 @@ on:
         description: "피드 생존 점검만 하기 (발송 안 함)"
         type: boolean
         default: false
+      test:
+        description: "형식 테스트 — 지금 가장 중요한 기사 1건만 무음 발송"
+        type: boolean
+        default: false
 
 concurrency:
   group: newswire
@@ -25,8 +29,16 @@ jobs:
         if: ${{ inputs.check }}
         run: python3 newswire.py --check
 
+      - name: 형식 테스트 (1건)
+        if: ${{ inputs.test && !inputs.check }}
+        run: python3 newswire.py --test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+
       - name: 상태 복원 (이미 보낸 기사 목록)
-        if: ${{ !inputs.check }}
+        if: ${{ !inputs.check && !inputs.test }}
         uses: actions/cache/restore@v4
         with:
           path: state
@@ -34,7 +46,7 @@ jobs:
           restore-keys: newswire-state-
 
       - name: 수집·발송
-        if: ${{ !inputs.check }}
+        if: ${{ !inputs.check && !inputs.test }}
         run: python3 newswire.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -44,7 +56,7 @@ jobs:
           LOOP_MINUTES:       ${{ vars.LOOP_MINUTES || '4' }}
 
       - name: 상태 저장
-        if: ${{ always() && !inputs.check }}
+        if: ${{ always() && !inputs.check && !inputs.test }}
         uses: actions/cache/save@v4
         with:
           path: state
