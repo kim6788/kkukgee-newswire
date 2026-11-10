@@ -554,6 +554,27 @@ def main():
                 print(f"FAIL       {name:<14} {url}  ← {type(e).__name__}: {str(e)[:80]}")
         return
 
+    if "--test" in sys.argv:               # 형식 테스트: 지금 기사 중 가장 중요한 1건만 무음으로 발송
+        raw = fetch_all({"feeds": {}})
+        cutoff = now_kst() - dt.timedelta(hours=3)
+        pool = [it for it in raw if not excluded(it) and (not it["date"] or it["date"] > cutoff)]
+        for it in pool:
+            it["kw"], it["kw_theme"] = kw_score(it)
+        pool.sort(key=lambda x: -x["kw"])
+        if not pool:
+            log("테스트할 기사 없음")
+            return
+        top = pool[:10]
+        review = llm_review(top) or {}
+        for i, c in enumerate(top):
+            c.update(review.get(i) or {"score": 4, "summary": "", "stocks": []})
+        best = max(top, key=lambda x: (bool(stock_tags(x)) and bool(x.get("summary") or teaser(x)),
+                                       x["score"], x["kw"]))
+        best["score"] = min(best["score"], 4)    # 테스트는 🚨 없이
+        ok = tg_send(fmt_item(best), silent=True)
+        log(f"테스트 발송 {'성공' if ok else '실패'}: {best['title']}")
+        return
+
     state = load_state()
     loop = float(os.environ.get("LOOP_MINUTES", "0") or 0)
     end = time.time() + loop * 60
